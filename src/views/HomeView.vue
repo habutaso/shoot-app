@@ -1,18 +1,37 @@
 <template>
   <div class="home">
-    <img alt="Vue logo" src="../assets/logo.png">
-    <HelloWorld msg="Welcome to Your Vue.js + TypeScript App"/>
+    <Shooter @shooted=shootedFunc />
+    <Thumbnail :blobs=blobs />
   </div>
 </template>
 
 <script lang="ts">
-import Vue from 'vue';
-import HelloWorld from '@/components/HelloWorld.vue'; // @ is an alias to /src
+import { defineComponent, ref } from '@vue/composition-api'
+import Shooter from '@/components/Shooter.vue'
+import Thumbnail from '@/components/Thumbnail.vue'
+import { PhotoDB, PhotoStateOutsideIDB } from '@/modules/PhotoDB'
 
-export default Vue.extend({
+export default defineComponent({
   name: 'HomeView',
   components: {
-    HelloWorld,
+    Shooter,
+    Thumbnail
   },
+  setup (props, context) {
+    const blobs = ref<any>([])
+    const photoDB = PhotoDB.instance
+    const shootedFunc = () => {
+      // photoDB.queryPrefixMatch('photo').then((ret: PhotoStateOutsideIDB[]) => {
+      //   console.log(ret)
+      //   blobs.value = ret.map(r => {
+      //     return r.blob
+      //   })
+      // })
+    }
+    return {
+      blobs,
+      shootedFunc
+    }
+  }
 });
 </script>
