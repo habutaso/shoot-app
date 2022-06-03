@@ -2,7 +2,18 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 /* eslint-disable @typescript-eslint/restrict-plus-operands */
 
-import { openDB } from 'idb'
+import { IDBPDatabase, openDB } from 'idb'
+import Compressor from 'compressorjs'
+
+const moji2mb = () => {
+  let ret = ''
+  let num = 0
+  do {
+    ret += 'Z'
+    num++
+  } while (num < 1_000_000)
+  return ret
+}
 
 /**
  * S3同期時、S3に施す操作
@@ -16,7 +27,7 @@ export type Operation = 'insert' | 'delete' | 'stay'
  * indexedDBに保存する画像管理オブジェクトのベース
  * 画像データと、どのような操作をされたかを持っている
  */
-interface PhotoState {
+export interface PhotoState {
   /**
    * S3に保存されているかどうか
    */
@@ -44,25 +55,6 @@ interface PhotoState {
    * TODO: ファイル名にエポック使ってるから要らないかも 2021/11/25 habu
    */
   expirationDate: number // 写真の有効期限(エポック秒)
-}
-
-/**
- * indexedDBに保存する画像管理オブジェクト
- */
-interface PhotoStateInIDB extends PhotoState {
-  /**
-   * 写真データ
-   * NOTE: indexedDBの内側では、画像をarraybufferとして扱う
-   * BUG: iPadでは、indexedDBでBlobを扱うことができない。その代わりArrayBufferで保存する方法がある。
-   * @see {@link https://stackoverflow.com/questions/40393488/mobile-safari-10-indexeddb-blobs}
-   */
-  blob: ArrayBuffer
-}
-
-/**
- * indexedDB外での画像管理オブジェクト
- */
-export interface PhotoStateOutsideIDB extends PhotoState {
   /**
    * 写真データ
    * NOTE: indexedDBの外側では、画像をblobとして扱う
@@ -71,6 +63,15 @@ export interface PhotoStateOutsideIDB extends PhotoState {
    */
   blob: Blob
 }
+
+/**
+ * indexedDBに保存する画像管理オブジェクト
+* NOTE: indexedDBの外側では、画像をblobとして扱う
+* BUG: iPadでは、indexedDBでBlobを扱うことができない。その代わりArrayBufferで保存する方法がある。
+* @see {@link https://stackoverflow.com/questions/40393488/mobile-safari-10-indexeddb-blobs}
+ */
+type PhotoStateInIDB = Omit<PhotoState, 'blob'> & { blob: ArrayBuffer }
+
 
 /**
  * indexedDBの管理とS3への連携を行うクラス
@@ -94,7 +95,18 @@ export class PhotoDB {
    * indexedDBクラス
    * TODO: add type 2021/11/25 habu
    */
-  private static _db: any
+  private static _db: IDBPDatabase
+
+  private static async openIDB(): Promise<void> {
+    const db = await openDB(PhotoDB._DB_NAME, 1, {
+      upgrade(db) {
+        const store = db.createObjectStore(PhotoDB._DB_STORE_NAME, { keyPath: 'id', autoIncrement: true })
+        store.createIndex('fileName', 'fileName', { unique: true })
+        store.createIndex('expirationDate', 'expirationDate', { unique: false })
+      }
+    })
+    PhotoDB._db = db
+  }
 
   /**
    * シングルトンインスタンスを取得する
@@ -102,40 +114,43 @@ export class PhotoDB {
    * @param なし
    * @returns PhotoDB - インスタンス
    */
-  public static get instance(): any {
+  public static instance(): PhotoDB {
     if (!PhotoDB._instance) {
-      const db = openDB(PhotoDB._DB_NAME, 1, {
-        upgrade(db) {
-          const store = db.createObjectStore(PhotoDB._DB_STORE_NAME, { keyPath: 'id', autoIncrement: true })
-          store.createIndex('fileName', 'fileName', { unique: true })
-          store.createIndex('expirationDate', 'expirationDate', { unique: false })
-        }
-      })
       PhotoDB._instance = new PhotoDB()
-      PhotoDB._db = db
+      PhotoDB.openIDB()
       return PhotoDB._instance
     }
     return PhotoDB._instance
   }
 
-  /**
-   * PhotoStateInIDBからPhotoStateOutsideIDBに変換する
-   * mobile iOSのindexedDBから取ってきた画像arraybufferをblobに変換して出力
-   * @param state PhotoStateInIDB
-   * @returns PhotoStateOutsideIDB
-   */
-  private convertInToOut(state: PhotoStateInIDB): PhotoStateOutsideIDB {
-    const newBlob = new Blob([state.blob])
-    return { ...state, blob: newBlob }
+  private compress(
+    file: Blob,
+    quality: number = 0.9,
+    maxWidth: number = 1500,
+    maxHeight: number = 1500
+  ): Promise<Blob> {
+    return new Promise<Blob>((resolve, reject) => {
+      new Compressor(file, { quality, maxWidth, maxHeight, success: resolve, error: reject })
+    })
   }
 
   /**
-   * PhotoStateOutsideIDBからPhotoStateInIDBに変換する
+   * PhotoStateInIDBからPhotoStateに変換する
+   * mobile iOSのindexedDBから取ってきた画像arraybufferをblobに変換して出力
+   * @param state PhotoStateInIDB
+   * @returns PhotoState
+   */
+  private convertInToOut(state: PhotoStateInIDB): PhotoState {
+    return { ...state, blob: new Blob([state.blob]) }
+  }
+
+  /**
+   * PhotoStateからPhotoStateInIDBに変換する
    * mobile iOSのindexedDBに画像を保存するため、blobからarraybufferに変換する
-   * @param state PhotoStateOutsideIDB
+   * @param state PhotoState
    * @returns PhotoStateInIDB
    */
-  private async convertOutToIn(state: PhotoStateOutsideIDB): Promise<PhotoStateInIDB> {
+  private async convertOutToIn(state: PhotoState): Promise<PhotoStateInIDB> {
     let arraybuffer: ArrayBuffer = new ArrayBuffer(0)
     await state.blob.arrayBuffer().then(ab => { arraybuffer = ab })
     return { ...state, blob: arraybuffer }
@@ -147,16 +162,17 @@ export class PhotoDB {
    * @param value 挿入したいPhotoState
    * @returns PhotoDBインスタンス
    */
-  public async insertItem(value: PhotoStateOutsideIDB | null): Promise<void> {
+  public async insertItem(value: PhotoState): Promise<void> {
+    if (!PhotoDB._db) await PhotoDB.openIDB()
     // BUG: iPadでは、indexedDBに画像を保存する時はarrayBufferにしないといけないようである。
     if (!value) return
     const newPhotoState: PhotoStateInIDB = await this.convertOutToIn(value)
-    const store = (await PhotoDB._db)
+    let store = PhotoDB._db
     // BUG: 保存は問題ないが、エラーが出る。
     // instanceでfileNameを一意にしているが以下のようなエラー内容となる。
     // Uncaught (in promise) DOMException: Unable to add key to index 'fileName': at least one key does not satisfy the uniqueness requirements.
-    store.put(PhotoDB._DB_STORE_NAME, newPhotoState).then((ret: any) => console.log(ret)).catch((err: any) => console.log(err))
-    value = null
+    await store.put(PhotoDB._DB_STORE_NAME, newPhotoState)
+      .then((ret: any) => console.log(ret)).catch((err: any) => console.error(err))
   }
 
   /**
@@ -165,19 +181,20 @@ export class PhotoDB {
    * @returns PhotoState
    * @see {@link PhotoState}
    */
-  public async getItem(key: string): Promise<PhotoStateOutsideIDB | undefined> {
-    const store = (await PhotoDB._db)
+  public async getItem(key: string): Promise<PhotoState | undefined> {
+    if (!PhotoDB._db) await PhotoDB.openIDB()
+    const store = PhotoDB._db
       .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
       .objectStore(PhotoDB._DB_STORE_NAME)
       .index('fileName')
-    const value = await store.get(key)
+    const value = await store.get(key).catch((err: any) => console.error(err))
     // ファイルが見つからない場合は、undefinedを返す
     if (value === undefined) {
       return undefined
     }
     // BUG: iPadでは、indexedDBに画像を保存する時はarrayBufferにしないといけないようである。
     // arrayBufferからBlobに直してから出力する
-    const newPhotoState: PhotoStateOutsideIDB = this.convertInToOut(value)
+    const newPhotoState: PhotoState = this.convertInToOut(value)
     return newPhotoState
   }
 
@@ -188,10 +205,11 @@ export class PhotoDB {
    * @return PhotoState[]
    * @see {@link PhotoState}
    */
-  public async queryPrefixMatch(key: string): Promise<PhotoStateOutsideIDB[]> {
+  public async queryPrefixMatch(key: string): Promise<PhotoState[]> {
+    if (!PhotoDB._db) await PhotoDB.openIDB()
     const nextStr = key.slice(0, -1) + String.fromCharCode(key.slice(-1).charCodeAt(0) + 1)
     const range = IDBKeyRange.bound(key, nextStr, false, true)
-    const store = (await PhotoDB._db)
+    const store = PhotoDB._db
       .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
       .objectStore(PhotoDB._DB_STORE_NAME)
       .index('fileName')
@@ -202,7 +220,7 @@ export class PhotoDB {
     }
     // BUG: iPadでは、indexedDBに画像を保存する時はarrayBufferにしないといけないようである。
     // arrayBufferからBlobに直してから出力する
-    const newPhotoState: PhotoStateOutsideIDB[] = value.map((item: PhotoStateInIDB) => {
+    const newPhotoState: PhotoState[] = value.map((item: PhotoStateInIDB) => {
       return this.convertInToOut(item)
     })
     return newPhotoState
@@ -215,11 +233,12 @@ export class PhotoDB {
    * @returns Promise<void>
    */
   public async deleteItem(keypath: string): Promise<void> {
-    const store = (await PhotoDB._db)
+    if (!PhotoDB._db) await PhotoDB.openIDB()
+    const store = PhotoDB._db
       .transaction([PhotoDB._DB_STORE_NAME], 'readwrite')
       .objectStore(PhotoDB._DB_STORE_NAME)
     const key = await store.index('fileName').getKey(keypath)
-    await store.delete(key)
+    await store.delete(key as IDBValidKey)
   }
 
   /**
@@ -245,11 +264,11 @@ export class PhotoDB {
    * TODO: 部位のinsertPhotoToIDBで追加している86400が間違っており、その差分を打ち消す実装にしています 2021/12/10 habu
    */
   public async bulkDeleteExpiredItemsFromIDB(now: number = Date.now()): Promise<void> {
-    let cursor = await (await PhotoDB._db)
+    let cursor = (await PhotoDB._db
       .transaction(PhotoDB._DB_STORE_NAME, 'readwrite')
       .objectStore(PhotoDB._DB_STORE_NAME)
-      .openCursor()
-    while (await cursor) {
+      .openCursor())
+    while (cursor) {
       // 撮影時刻 + 有効期限差分 < 現在時間だったら写真を削除する
       if (cursor.value.expirationDate + PhotoDB.EXPIRATION_DELTA < now) {
         cursor.delete()

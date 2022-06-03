@@ -9,7 +9,7 @@
 import { defineComponent, ref } from '@vue/composition-api'
 import Shooter from '@/components/Shooter.vue'
 import Thumbnail from '@/components/Thumbnail.vue'
-import { PhotoDB, PhotoStateOutsideIDB } from '@/modules/PhotoDB'
+import { PhotoDB, PhotoState } from '@/modules/PhotoDB'
 
 export default defineComponent({
   name: 'HomeView',
@@ -21,12 +21,11 @@ export default defineComponent({
     const blobs = ref<any>([])
     const photoDB = PhotoDB.instance
     const shootedFunc = () => {
-      // photoDB.queryPrefixMatch('photo').then((ret: PhotoStateOutsideIDB[]) => {
-      //   console.log(ret)
-      //   blobs.value = ret.map(r => {
-      //     return r.blob
-      //   })
-      // })
+      photoDB.queryPrefixMatch('photo').then((ret: PhotoState[]) => {
+        blobs.value = ret.map(r => {
+          return r.blob
+        })
+      })
     }
     return {
       blobs,

@@ -8,7 +8,7 @@
   </div>
 </template>
 
-<script>
+<script lang="ts">
 import { computed, defineComponent } from '@vue/composition-api'
 export default defineComponent ({
   name: 'ThumbnailComp',
@@ -19,7 +19,7 @@ export default defineComponent ({
     const shoable = computed(() => {
       if (!props.blobs) return []
       return props.blobs.map(b => {
-        return b
+        return URL.createObjectURL(b)
       })
     })
     return {
