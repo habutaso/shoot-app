@@ -72,6 +72,8 @@ export interface PhotoState {
  */
 type PhotoStateInIDB = Omit<PhotoState, 'blob'> & { blob: ArrayBuffer }
 
+export const THUMBNAIL_WIDTH = 70
+export const THUMBNAIL_HEIGHT = 70
 
 /**
  * indexedDBの管理とS3への連携を行うクラス
@@ -87,6 +89,18 @@ export class PhotoDB {
    * 有効期限差分。エポックミリ秒で1日分にしている。
    */
   private static readonly EXPIRATION_DELTA: number = 86400000
+  /**
+   * サムネイル用に保存する画像の暗黙的ファイル名プレフィックス
+   */
+  private static readonly THUMBNAIL_PREFIX: string = 'thumbnail'
+  /**
+   * サムネイル用画像のクオリティ
+   */
+  private static readonly THUMBNAIL_QUALITY: number = 0.2
+  /**
+   * lazyなqueryで一度に返却する要素数
+   */
+  private static readonly ONCE_QUERY_LIMIT: number = 40
   /**
    * シングルトンインスタンス
    */
@@ -123,15 +137,34 @@ export class PhotoDB {
     return PhotoDB._instance
   }
 
-  private compress(
-    file: Blob,
-    quality: number = 0.9,
-    maxWidth: number = 1500,
-    maxHeight: number = 1500
-  ): Promise<Blob> {
+  /**
+   * 画像サイズを軽量化する
+   * @param value PhotoState
+   * @param quality 画質 0 - 1 の少数
+   * @param maxWidth 最大横幅px
+   * @param maxHeight 最大縦幅px
+   * @returns 
+   */
+  private async compressSub(file: Blob, quality = 0.9, maxWidth = 1500, maxHeight = 1500): Promise<Blob> {
     return new Promise<Blob>((resolve, reject) => {
       new Compressor(file, { quality, maxWidth, maxHeight, success: resolve, error: reject })
     })
+  }
+
+  /**
+   * 画像サイズを軽量化する
+   * @param value PhotoState
+   * @param quality 画質 0 - 1 の少数
+   * @param maxWidth 最大横幅px
+   * @param maxHeight 最大縦幅px
+   * @returns 
+   */
+  private async compress(value: PhotoState, quality = 0.9, maxWidth = 1500, maxHeight = 1500): Promise<PhotoState> {
+    if (!value.blob.type) {
+      value.blob = new Blob([value.blob], { type: value.mime })
+    }
+    const compressed: Blob = await this.compressSub(value.blob, quality, maxWidth, maxHeight)
+    return { ...value, blob: compressed }
   }
 
   /**
@@ -141,7 +174,7 @@ export class PhotoDB {
    * @returns PhotoState
    */
   private convertInToOut(state: PhotoStateInIDB): PhotoState {
-    return { ...state, blob: new Blob([state.blob]) }
+    return { ...state, blob: new Blob([state.blob], { type: state.mime }) }
   }
 
   /**
@@ -167,7 +200,7 @@ export class PhotoDB {
     // BUG: iPadでは、indexedDBに画像を保存する時はarrayBufferにしないといけないようである。
     if (!value) return
     const newPhotoState: PhotoStateInIDB = await this.convertOutToIn(value)
-    let store = PhotoDB._db
+    const store = PhotoDB._db
     // BUG: 保存は問題ないが、エラーが出る。
     // instanceでfileNameを一意にしているが以下のようなエラー内容となる。
     // Uncaught (in promise) DOMException: Unable to add key to index 'fileName': at least one key does not satisfy the uniqueness requirements.
@@ -226,6 +259,29 @@ export class PhotoDB {
     return newPhotoState
   }
 
+  public async *queryPrefixMatchLazy(key: string) {
+    if (!PhotoDB._db) await PhotoDB.openIDB()
+    const cursor = (await PhotoDB._db
+      .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
+      .objectStore(PhotoDB._DB_STORE_NAME)
+      .openCursor())
+    // ファイルが見つからない場合は、空を返す
+    let ret: PhotoState[] = []
+    let limit = 0
+    while (cursor) {
+      if (cursor.value.fileName.indexOf(key) === 0) {
+        ret.push(cursor.value)
+      }
+      limit++
+      if (limit === PhotoDB.ONCE_QUERY_LIMIT) {
+        yield ret
+        ret = []
+        limit = 0
+      }
+    }
+    yield ret
+  }
+
   /**
    * indexedDBからkeyに対応するPhotoStateを削除する
    * @see {link PhotoState}
@@ -239,6 +295,52 @@ export class PhotoDB {
       .objectStore(PhotoDB._DB_STORE_NAME)
     const key = await store.index('fileName').getKey(keypath)
     await store.delete(key as IDBValidKey)
+  }
+
+  /**
+   * サムネイル用の画像を保存する
+   * @param value PhotoState
+   * @param maxWidth サムネ最大横幅px
+   * @param maxHeight サムネ最大立幅px
+   */
+  public async insertThumbnail(value: PhotoState, maxWidth = THUMBNAIL_WIDTH, maxHeight = THUMBNAIL_HEIGHT): Promise<void> {
+    const compressed: PhotoState = await this.compress(value, PhotoDB.THUMBNAIL_QUALITY, maxWidth, maxHeight)
+    await this.insertItem({ ...compressed, fileName: PhotoDB.THUMBNAIL_PREFIX + value.fileName })
+  }
+
+  /**
+   * サムネイル用の画像を1枚取得する
+   * @param key ファイル名
+   * @returns サムネイル用のPhotoState
+   */
+  public async getThumbnail(key: string) {
+    return await this.getItem(PhotoDB.THUMBNAIL_PREFIX + key)
+  }
+
+  /**
+   * 
+   * @param key ファイル名に前方一致させたい文字列
+   * @returns PhotoState[] 複数の画像データ
+   */
+  public async queryThumbnail(key: string) {
+    return await this.queryPrefixMatch(PhotoDB.THUMBNAIL_PREFIX + key)
+  }
+
+  /**
+   * 1)撮影した画像そのもの, 2)サムネイル用の2データを保存する
+   * @param value PhotoState
+   * @param maxWidth サムネ最大横幅px
+   * @param maxHeight サムネ最大縦幅px
+   */
+  public async insertItemWithThumbnail(value: PhotoState, maxWidth = THUMBNAIL_WIDTH, maxHeight = THUMBNAIL_HEIGHT): Promise<void> {
+    console.log('PhotoDB.insertItemWithThumbnail', value)
+    await this.insertItem(value)
+    await this.insertThumbnail(value, maxWidth, maxHeight)
+  }
+
+  public async deleteItemWithThumbnail(key: string) {
+    await this.deleteItem(key)
+    await this.deleteItem(PhotoDB.THUMBNAIL_PREFIX + key)
   }
 
   /**

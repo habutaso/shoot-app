@@ -1,34 +1,46 @@
 <template>
-  <div>
-    <div>a</div>
-    <div>{{shoable}}</div>
-    <div v-for="(b, name) in shoable" :key=name>
-      <div>name</div>
+  <div class="thumbnail">
+    <div v-for="(b, name) in showable" :key=name>
+      <div>{{name}}</div>
+      <ImageCanvas :blob=b.blob :photoId=b.fileName />
     </div>
   </div>
 </template>
 
 <script lang="ts">
 import { computed, defineComponent } from '@vue/composition-api'
+import { PhotoState } from '@/modules/PhotoDB'
+import ImageCanvas from '@/components/ImageCanvas.vue'
+
 export default defineComponent ({
   name: 'ThumbnailComp',
+  components: {
+    ImageCanvas
+  },
   props: {
-    blobs: Array
+    blobs: {
+      type: Array,
+      required: true
+    }
   },
   setup (props, _) {
-    const shoable = computed(() => {
-      if (!props.blobs) return []
-      return props.blobs.map(b => {
-        return URL.createObjectURL(b)
+    const showable = computed(() => {
+      return (props.blobs as PhotoState[]).map((b: PhotoState) => {
+        return {...b, fileName: b.fileName.replace(/\//, '')}
       })
     })
     return {
-      shoable
+      showable
     }
   }
 })
 </script>
 
-<style>
-
+<style scoped>
+.thumbnail {
+  width: 100%;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
 </style>

@@ -1,7 +1,9 @@
 <template>
   <div class="home">
     <Shooter @shooted=shootedFunc />
-    <Thumbnail :blobs=blobs />
+    <button @click=toggleThumbnail>toggle thumbnail</button>
+    <p>file quantity{{blobs.length}}</p>
+    <Thumbnail v-if=isShow :isShow=isShow :blobs=blobs />
   </div>
 </template>
 
@@ -19,17 +21,21 @@ export default defineComponent({
   },
   setup (props, context) {
     const blobs = ref<any>([])
-    const photoDB = PhotoDB.instance
-    const shootedFunc = () => {
-      photoDB.queryPrefixMatch('photo').then((ret: PhotoState[]) => {
-        blobs.value = ret.map(r => {
-          return r.blob
-        })
-      })
+    const photoDB = PhotoDB.instance()
+    const isShow = ref<boolean>(true)
+    const shootedFunc = async () => {
+      await photoDB.queryThumbnail('photo')
+        .then((ret: PhotoState[]) => { blobs.value = ret })
+    }
+    const toggleThumbnail = () => {
+      isShow.value = !isShow.value
+      console.log("toggled")
     }
     return {
       blobs,
-      shootedFunc
+      isShow,
+      shootedFunc,
+      toggleThumbnail
     }
   }
 });

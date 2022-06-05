@@ -30,14 +30,15 @@ export default defineComponent({
         expirationDate: Date.now(),
         blob: newBlob
       }
+      console.log('item', item)
       const interval = setInterval(() => {
         onChangeFileInterval(item)
-      }, 5000)
+      }, 1000)
       context.emit('shooted')
     }
     const onChangeFileInterval = async (item: any) => {
       const fileName = `photo-${uuidv4()}`
-      await photoDB.insertItem({...item, fileName})
+      await photoDB.insertItemWithThumbnail({...item, fileName})
       context.emit('shooted')
     }
     return {
