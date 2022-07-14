@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 /* eslint-disable @typescript-eslint/restrict-plus-operands */
 
-import { IDBPCursorWithValue, IDBPDatabase, openDB } from 'idb'
+import { IDBPCursorWithValue, IDBPDatabase, openDB, DBSchema } from 'idb'
 import Compressor from 'compressorjs'
 
 const moji2mb = () => {
@@ -27,7 +27,7 @@ export type Operation = 'insert' | 'delete' | 'stay'
  * indexedDBに保存する画像管理オブジェクトのベース
  * 画像データと、どのような操作をされたかを持っている
  */
-export interface PhotoState {
+interface PhotoStateBase {
   /**
    * S3に保存されているかどうか
    */
@@ -55,6 +55,9 @@ export interface PhotoState {
    * TODO: ファイル名にエポック使ってるから要らないかも 2021/11/25 habu
    */
   expirationDate: number // 写真の有効期限(エポック秒)
+}
+
+export interface PhotoState extends PhotoStateBase {
   /**
    * 写真データ
    * NOTE: indexedDBの外側では、画像をblobとして扱う
@@ -64,27 +67,66 @@ export interface PhotoState {
   blob: Blob
 }
 
+type PhotoStateInIDB = Omit<PhotoState, 'blob'> & { blob: ArrayBuffer }
+
 /**
  * indexedDBに保存する画像管理オブジェクト
-* NOTE: indexedDBの外側では、画像をblobとして扱う
-* BUG: iPadでは、indexedDBでBlobを扱うことができない。その代わりArrayBufferで保存する方法がある。
-* @see {@link https://stackoverflow.com/questions/40393488/mobile-safari-10-indexeddb-blobs}
+ * NOTE: indexedDBの外側では、画像をblobとして扱う
+ * BUG: iPadでは、indexedDBでBlobを扱うことができない。その代わりArrayBufferで保存する方法がある。
+ * @see {@link https://stackoverflow.com/questions/40393488/mobile-safari-10-indexeddb-blobs}
  */
-type PhotoStateInIDB = Omit<PhotoState, 'blob'> & { blob: ArrayBuffer }
+interface PhotoDBSchema extends DBSchema {
+  photoDB: {
+    value: PhotoStateInIDB
+    key: number
+    indexes: { 'fileName': string, 'expirationDate': number }
+  }
+}
 
 export const THUMBNAIL_WIDTH = 70
 export const THUMBNAIL_HEIGHT = 70
+
+class DB {
+  /**
+   * indexedDBクラス
+   */
+  private static _db: Promise<IDBPDatabase<PhotoDBSchema>> | null
+
+  constructor() {
+    DB._db = DB.generateIDB()
+  }
+
+  private static generateIDB(): Promise<IDBPDatabase<PhotoDBSchema>> {
+    return openDB<PhotoDBSchema>('DisasterInvDB', 1, {
+      upgrade(db) {
+        const store = db.createObjectStore('photoDB', { keyPath: 'id', autoIncrement: true })
+        store.createIndex('fileName', 'fileName', { unique: true })
+        store.createIndex('expirationDate', 'expirationDate', { unique: false })
+      }
+    })
+  }
+
+  public static openIDB(): void {
+    DB._db = DB.generateIDB()
+  }
+
+  public static async closeIDB(): Promise<void> {
+    if (!DB._db) return
+    (await DB._db).close()
+    DB._db = null
+  }
+
+}
 
 /**
  * indexedDBの管理とS3への連携を行うクラス
  * ここでは必要最低限の機能を提供する
  */
-export class PhotoDB {
+class PhotoDB {
   /**
    * indexedDBデータベース名
    */
   private static readonly _DB_NAME: string = 'DisasterInvDB'
-  private static readonly _DB_STORE_NAME: string = 'photoDB'
   /**
    * 有効期限差分。エポックミリ秒で1日分にしている。
    */
@@ -104,16 +146,16 @@ export class PhotoDB {
   /**
    * シングルトンインスタンス
    */
-  private static _instance: PhotoDB
+  private static _instance: PhotoDB | null
   /**
    * indexedDBクラス
    */
-  private static _db: Promise<IDBPDatabase>
+  private static _db: Promise<IDBPDatabase<PhotoDBSchema>>
 
   private static openIDB(): void {
-    const db = openDB(PhotoDB._DB_NAME, 1, {
+    const db = openDB<PhotoDBSchema>(PhotoDB._DB_NAME, 1, {
       upgrade(db) {
-        const store = db.createObjectStore(PhotoDB._DB_STORE_NAME, { keyPath: 'id', autoIncrement: true })
+        const store = db.createObjectStore('photoDB', { keyPath: 'id', autoIncrement: true })
         store.createIndex('fileName', 'fileName', { unique: true })
         store.createIndex('expirationDate', 'expirationDate', { unique: false })
       }
@@ -203,7 +245,7 @@ export class PhotoDB {
     // BUG: 保存は問題ないが、エラーが出る。
     // instanceでfileNameを一意にしているが以下のようなエラー内容となる。
     // Uncaught (in promise) DOMException: Unable to add key to index 'fileName': at least one key does not satisfy the uniqueness requirements.
-    await store.put(PhotoDB._DB_STORE_NAME, newPhotoState)
+    await store.put('photoDB', newPhotoState)
       .then((ret: any) => console.log(ret)).catch((err: any) => console.error(err))
   }
 
@@ -215,11 +257,10 @@ export class PhotoDB {
    */
   public async getItem(key: string): Promise<PhotoState | undefined> {
     if (!PhotoDB._db) PhotoDB.openIDB()
-    const store = (await PhotoDB._db)
-      .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
-      .objectStore(PhotoDB._DB_STORE_NAME)
-      .index('fileName')
+    const tx = (await PhotoDB._db).transaction('photoDB', 'readonly')
+    const store = tx.objectStore('photoDB').index('fileName')
     const value = await store.get(key).catch((err: any) => console.error(err))
+    await tx.done
     // ファイルが見つからない場合は、undefinedを返す
     if (value === undefined) {
       return undefined
@@ -241,11 +282,10 @@ export class PhotoDB {
     if (!PhotoDB._db) await PhotoDB.openIDB()
     const nextStr = key.slice(0, -1) + String.fromCharCode(key.slice(-1).charCodeAt(0) + 1)
     const range = IDBKeyRange.bound(key, nextStr, false, true)
-    const store = (await PhotoDB._db)
-      .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
-      .objectStore(PhotoDB._DB_STORE_NAME)
-      .index('fileName')
+    const tx = (await PhotoDB._db).transaction('photoDB', 'readonly')
+    const store = tx.objectStore('photoDB').index('fileName')
     const value = await store.getAll(range)
+    await tx.done
     // ファイルが見つからない場合は、空を返す
     if (value.length < 1) {
       return []
@@ -258,29 +298,28 @@ export class PhotoDB {
     return newPhotoState
   }
 
-  // public async *queryPrefixMatchLazy(key: string) {
-  //   if (!PhotoDB._db) await PhotoDB.openIDB()
-  //   let cursor = (await (await PhotoDB._db)
-  //     .transaction(PhotoDB._DB_STORE_NAME, 'readonly')
-  //     .objectStore(PhotoDB._DB_STORE_NAME)
-  //     .openCursor() as unknown as IDBPCursorWithValue)
-  //   // ファイルが見つからない場合は、空を返す
-  //   let ret: PhotoState[] = []
-  //   let limit = 0
-  //   while (cursor) {
-  //     if (cursor.value.fileName.indexOf(key) === 0) {
-  //       ret.push(cursor.value)
-  //     }
-  //     limit++
-  //     cursor = await cursor.continue()
-  //     if (limit === PhotoDB.ONCE_QUERY_LIMIT) {
-  //       yield ret
-  //       ret = []
-  //       limit = 0
-  //     }
-  //   }
-  //   yield ret
-  // }
+  public async *queryPrefixMatchLazy(key: string) {
+    if (!PhotoDB._db) await PhotoDB.openIDB()
+    const tx = (await PhotoDB._db).transaction('photoDB', 'readonly')
+    let cursor = await tx.objectStore('photoDB').openCursor()
+    // ファイルが見つからない場合は、空を返す
+    let ret: PhotoState[] = []
+    let limit = 0
+    while (cursor) {
+      if (cursor.value.fileName.indexOf(key) === 0) {
+        ret.push(this.convertInToOut(cursor.value))
+      }
+      limit++
+      cursor = await cursor.continue()
+      if (limit === PhotoDB.ONCE_QUERY_LIMIT) {
+        yield ret
+        ret = []
+        limit = 0
+      }
+    }
+    yield ret
+    await tx.done
+  }
 
   /**
    * indexedDBからkeyに対応するPhotoStateを削除する
@@ -291,10 +330,10 @@ export class PhotoDB {
   public async deleteItem(keypath: string): Promise<void> {
     if (!PhotoDB._db) await PhotoDB.openIDB()
     const store = (await PhotoDB._db)
-      .transaction([PhotoDB._DB_STORE_NAME], 'readwrite')
-      .objectStore(PhotoDB._DB_STORE_NAME)
+      .transaction(['photoDB'], 'readwrite')
+      .objectStore('photoDB')
     const key = await store.index('fileName').getKey(keypath)
-    await store.delete(key as IDBValidKey)
+    await store.delete(key as number)
   }
 
   /**
@@ -366,10 +405,8 @@ export class PhotoDB {
    * TODO: 部位のinsertPhotoToIDBで追加している86400が間違っており、その差分を打ち消す実装にしています 2021/12/10 habu
    */
   public async bulkDeleteExpiredItemsFromIDB(now: number = Date.now()): Promise<void> {
-    let cursor = await (await PhotoDB._db)
-      .transaction(PhotoDB._DB_STORE_NAME, 'readwrite')
-      .objectStore(PhotoDB._DB_STORE_NAME)
-      .openCursor()
+    const tx = (await PhotoDB._db).transaction('photoDB', 'readwrite')
+    let cursor = await tx.objectStore('photoDB').openCursor()
     while (cursor) {
       // 撮影時刻 + 有効期限差分 < 現在時間だったら写真を削除する
       if (cursor.value.expirationDate + PhotoDB.EXPIRATION_DELTA < now) {
@@ -377,8 +414,11 @@ export class PhotoDB {
       }
       cursor = await cursor.continue()
     }
+    await tx.done
   }
 }
+
+export const photoDB = new PhotoDB()
 
 /* eslint-enable @typescript-eslint/strict-boolean-expressions */
 /* eslint-enable @typescript-eslint/no-non-null-assertion */

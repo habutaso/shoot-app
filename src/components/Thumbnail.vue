@@ -25,6 +25,9 @@ export default defineComponent ({
   },
   setup (props, _) {
     const showable = computed(() => {
+      if (props.blobs.length < 1) {
+        return []
+      }
       return (props.blobs as PhotoState[]).map((b: PhotoState) => {
         return {...b, fileName: b.fileName.replace(/\//, '')}
       })

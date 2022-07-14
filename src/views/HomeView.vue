@@ -11,7 +11,7 @@
 import { defineComponent, ref } from '@vue/composition-api'
 import Shooter from '@/components/Shooter.vue'
 import Thumbnail from '@/components/Thumbnail.vue'
-import { PhotoDB, PhotoState } from '@/modules/PhotoDB'
+import { photoDB, PhotoState, PhotoStateInIDB } from '@/modules/PhotoDB2'
 
 export default defineComponent({
   name: 'HomeView',
@@ -21,11 +21,32 @@ export default defineComponent({
   },
   setup (props, context) {
     const blobs = ref<any>([])
-    const photoDB = PhotoDB.instance()
     const isShow = ref<boolean>(true)
-    const shootedFunc = async () => {
-      await photoDB.queryThumbnail('photo')
-        .then((ret: PhotoState[]) => { blobs.value = ret })
+    /**
+     * PhotoStateInIDBからPhotoStateに変換する
+     * mobile iOSのindexedDBから取ってきた画像arraybufferをblobに変換して出力
+     * @param state PhotoStateInIDB
+     * @returns PhotoState
+     */
+    const convertInToOut = (state: PhotoStateInIDB): PhotoState => {
+      return { ...state, blob: new Blob([state.blob], { type: state.mime }) }
+    }
+    const queryPrefixMatch = async (key: string): Promise<Array<PhotoState>> => {
+      const ret = await photoDB.photostate.where('fileName').startsWith(key).toArray()
+      if (ret.length < 1) {
+        return []
+      }
+      return ret.map((item: PhotoStateInIDB) => convertInToOut(item))
+    }
+    const getItem = async (key: string): Promise<PhotoState | undefined> => {
+    const ret = await photoDB.photostate.get({ fileName: key })
+    if (!ret) return
+    return convertInToOut(ret)
+  }
+    const shootedFunc = async (fileName: string) => {
+      // console.log(fileName)
+      // await getItem(fileName)
+      //   .then((ret: PhotoState | undefined) => { blobs.value = ret === undefined ? blobs.value: [...blobs.value, ret] })
     }
     const toggleThumbnail = () => {
       isShow.value = !isShow.value
